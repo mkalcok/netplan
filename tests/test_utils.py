@@ -27,7 +27,7 @@ from contextlib import redirect_stdout
 from netplan.cli.core import Netplan
 import netplan.cli.utils as utils
 import netplan.libnetplan as libnetplan
-from unittest.mock import patch
+from unittest.mock import mock_open, patch
 
 
 DEVICES = ['eth0', 'eth1', 'ens3', 'ens4', 'br0']
@@ -371,3 +371,54 @@ class TestUtils(unittest.TestCase):
         self.assertEqual(self.mock_cmd.calls(), [
             ['ip', 'addr', 'flush', 'eth42']
         ])
+
+    @patch('os.path.islink')
+    def test_is_interface_bonded_true(self, islink):
+        islink.return_value = True
+        if_name = "enp3"
+        bond_master = os.path.join('/sys/class/net', if_name, 'master')
+
+        self.assertTrue(utils.is_interface_bonded(if_name))
+
+        islink.assert_called_once_with(bond_master)
+
+    @patch('os.path.islink')
+    def test_is_interface_bonded_false(self, islink):
+        islink.return_value = False
+        if_name = "enp3"
+        bond_master = os.path.join('/sys/class/net', if_name, 'master')
+
+        self.assertFalse(utils.is_interface_bonded(if_name))
+
+        islink.assert_called_once_with(bond_master)
+
+    @patch('netplan.cli.utils.is_interface_bonded', return_value=False)
+    def test_get_interface_bond_type_not_bonded(self, is_interface_bonded):
+        if_name = "enp3"
+
+        self.assertIsNone(utils.get_interface_bond_type(if_name))
+        is_interface_bonded.assert_called_once_with(if_name)
+
+    @patch('netplan.cli.utils.is_interface_bonded', return_value=True)
+    def test_get_interface_bond_type_active_backup(self, _):
+        if_name = "enp3"
+        bond_mode = "active-backup 1"
+        bond_mode_file = os.path.join("/sys/class/net", if_name, "master",
+                                      "bonding", "mode")
+        expected_value = 1
+
+        with patch("builtins.open", mock_open(read_data=bond_mode)) as mock_file:
+            self.assertEqual(utils.get_interface_bond_type(if_name), expected_value)
+            mock_file.assert_called_once_with(bond_mode_file, "r")
+
+    @patch('netplan.cli.utils.is_interface_bonded', return_value=True)
+    def test_get_interface_bond_type_unknown_format(self, _):
+        if_name = "enp3"
+        bond_mode = "foo"
+        bond_mode_file = os.path.join("/sys/class/net", if_name, "master",
+                                      "bonding", "mode")
+
+        with patch("builtins.open", mock_open(read_data=bond_mode)) as mock_file:
+            with self.assertRaises(RuntimeError):
+                utils.get_interface_bond_type(if_name)
+            mock_file.assert_called_once_with(bond_mode_file, "r")

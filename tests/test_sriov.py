@@ -22,9 +22,10 @@ import unittest
 
 from subprocess import CalledProcessError
 from collections import defaultdict
-from unittest.mock import patch, mock_open, call
+from unittest.mock import ANY, patch, mock_open, call, PropertyMock
 
 import netplan.cli.sriov as sriov
+import netplan.cli.commands.sriov_rebind as sriov_rebind
 import netplan.libnetplan as libnetplan
 
 from netplan.configmanager import ConfigManager, ConfigurationError
@@ -827,7 +828,8 @@ MODALIAS=pci:v00008086d0000156Fsv000017AAsd00002245bc02sc00i00
     @patch('netplan.cli.sriov.PCIDevice.bound', new_callable=unittest.mock.PropertyMock)
     @patch('netplan.cli.sriov.PCIDevice.sys', new_callable=unittest.mock.PropertyMock)
     @patch('netplan.cli.commands.sriov_rebind._get_pci_slot_name')
-    def test_cli_rebind(self, gpsn, sys_mock, bound_mock):
+    @patch('netplan.cli.commands.sriov_rebind.NetplanSriovRebind.wait_vf_lag_active')
+    def test_cli_rebind(self, wait_vf_lag, gpsn, sys_mock, bound_mock):
         self._prepare_sysfs_dir_structure(pf=('enp3s0f0', '0000:03:00.0'),
                                           vfs=[('enp3s0f0v0', '0000:03:00.2'),
                                                ('enp3s0f0v1', '0000:03:00.3')],
@@ -850,6 +852,156 @@ MODALIAS=pci:v00008086d0000156Fsv000017AAsd00002245bc02sc00i00
             self.assertEqual(mock_file.return_value.write.call_args_list, [
                 call('0000:03:00.2'),
                 call('0000:03:00.3')])
+            wait_vf_lag.assert_called_once_with("enp3s0f0", ANY)
+
+    @patch('netplan.cli.commands.sriov_rebind.is_vf_lag_enabled')
+    @patch('netplan.cli.commands.sriov_rebind.is_vf_lag_active')
+    def test_wait_vf_lag_active_disabled(self, is_vf_lag_active, is_vf_lag_enabled):
+        """Test 'wait_vf_lag_active' function when VF LAG is not supported.
+
+        If PCI device does not support VF lag, this function should return immediately.
+        """
+        is_vf_lag_enabled.return_value = False
+        if_name = "enp3s0f0"
+        pci_dev = unittest.mock.MagicMock()
+
+        rebind_command = sriov_rebind.NetplanSriovRebind()
+        rebind_command.wait_vf_lag_active(if_name, pci_dev)
+
+        is_vf_lag_enabled.assert_called_once_with(if_name, pci_dev)
+        is_vf_lag_active.assert_not_called()
+
+    @patch('netplan.cli.commands.sriov_rebind.is_vf_lag_enabled')
+    @patch('netplan.cli.commands.sriov_rebind.is_vf_lag_active')
+    def test_wait_vf_lag_active_enabled(self, is_vf_lag_active, is_vf_lag_enabled):
+        """Test 'wait_vf_lag_active' function when VF LAG is supported."""
+        is_vf_lag_enabled.return_value = True
+        is_vf_lag_active.return_value = True
+        if_name = "enp3s0f0"
+        pci_dev = unittest.mock.MagicMock()
+
+        rebind_command = sriov_rebind.NetplanSriovRebind()
+        rebind_command.timeout = sriov_rebind.DEFAULT_VF_LAG_TIMEOUT
+        rebind_command.wait_vf_lag_active(if_name, pci_dev)
+
+        is_vf_lag_enabled.assert_called_once_with(if_name, pci_dev)
+        is_vf_lag_active.assert_called_once_with(pci_dev)
+
+    @patch('netplan.cli.commands.sriov_rebind.is_vf_lag_enabled')
+    @patch('netplan.cli.commands.sriov_rebind.is_vf_lag_active')
+    @patch('netplan.cli.commands.sriov_rebind.time.sleep')
+    def test_wait_vf_lag_active_timeout(self, _, is_vf_lag_active, is_vf_lag_enabled):
+        """Test that 'wait_vf_lag_active' function raises exception on timeout."""
+        is_vf_lag_enabled.return_value = True
+        is_vf_lag_active.return_value = False
+        if_name = "enp3s0f0"
+        pci_dev = unittest.mock.MagicMock()
+        timeout = 5
+        expected_active_calls = [call(pci_dev) for _ in range(timeout)]
+
+        rebind_command = sriov_rebind.NetplanSriovRebind()
+        rebind_command.timeout = timeout
+        with self.assertRaises(RuntimeError):
+            rebind_command.wait_vf_lag_active(if_name, pci_dev)
+
+        is_vf_lag_enabled.assert_called_once_with(if_name, pci_dev)
+        is_vf_lag_active.assert_has_calls(expected_active_calls)
+
+    @patch('netplan.cli.utils.get_interface_bond_type')
+    def test_is_vf_lag_enabled_not_supported_feature(self, get_interface_bond_type):
+        """Test return value of is_vf_lag_enabled when NIC does not support VF LAG."""
+        if_name = "enp3"
+        unsupported_driver = "generic"
+        driver_prop = PropertyMock(return_value=unsupported_driver)
+
+        with patch("netplan.cli.sriov.PCIDevice.driver", new_callable=driver_prop):
+            pci_device = sriov.PCIDevice("00:00:01")
+            self.assertFalse(sriov.is_vf_lag_enabled(if_name, pci_device))
+            get_interface_bond_type.assert_not_called()
+
+    @patch('netplan.cli.utils.get_interface_bond_type')
+    def test_is_vf_lag_enabled_bond_detect_failure(self, get_interface_bond_type):
+        """Test return value of is_vf_lag_enabled when we fail to detect bond type."""
+        if_name = "enp3"
+        driver = "mlx5_core"
+        driver_prop = PropertyMock(return_value=driver)
+        get_interface_bond_type.side_effect = RuntimeError()
+
+        with patch("netplan.cli.sriov.PCIDevice.driver", new_callable=driver_prop):
+            pci_device = sriov.PCIDevice("00:00:01")
+            self.assertFalse(sriov.is_vf_lag_enabled(if_name, pci_device))
+            get_interface_bond_type.assert_called_once_with(if_name)
+
+    @patch('netplan.cli.utils.get_interface_bond_type')
+    def test_is_vf_lag_enabled_not_supported_bond(self, get_interface_bond_type):
+        """Test return value of is_vf_lag_enabled when NIC is in unsupported bond.
+
+        VF LAG is compatible only with some bonding types. It will be disabled if
+        interface is in unsupported bond.
+        """
+        if_name = "enp3"
+        driver = "mlx5_core"
+        driver_prop = PropertyMock(return_value=driver)
+        unsupported_bond_type = 99
+        get_interface_bond_type.return_value = unsupported_bond_type
+
+        with patch("netplan.cli.sriov.PCIDevice.driver", new_callable=driver_prop):
+            pci_device = sriov.PCIDevice("00:00:01")
+            self.assertFalse(sriov.is_vf_lag_enabled(if_name, pci_device))
+            get_interface_bond_type.assert_called_once_with(if_name)
+
+    @patch('netplan.cli.utils.get_interface_bond_type')
+    def test_is_vf_lag_enabled_supported_bond(self, get_interface_bond_type):
+        """Test return value of is_vf_lag_enabled when NIC is in supported bond.
+
+        VF LAG is compatible only with some bonding types. It will be marked as enabled
+        only if interface is in supported bond type.
+        """
+        if_name = "enp3"
+        driver = "mlx5_core"
+        driver_prop = PropertyMock(return_value=driver)
+        supported_bond_type = 1
+        get_interface_bond_type.return_value = supported_bond_type
+
+        with patch("netplan.cli.sriov.PCIDevice.driver", new_callable=driver_prop):
+            pci_device = sriov.PCIDevice("00:00:01")
+            self.assertTrue(sriov.is_vf_lag_enabled(if_name, pci_device))
+            get_interface_bond_type.assert_called_once_with(if_name)
+
+    def test_is_vf_lag_active_true(self):
+        """Test that is_vf_lag_active returns True if state file contains 'active'."""
+        lag_state = "active"
+        pci_device_addr = "00:00:01"
+        lag_state_file = os.path.join("/sys/kernel/debug/mlx5", pci_device_addr,
+                                      "lag", "state")
+        with patch("builtins.open", mock_open(read_data=lag_state)) as mock_file:
+            pci_device = sriov.PCIDevice(pci_device_addr)
+            self.assertTrue(sriov.is_vf_lag_active(pci_device))
+            mock_file.assert_called_once_with(lag_state_file, "r")
+
+    def test_is_vf_lag_active_false(self):
+        """Test that is_vf_lag_active returns False if state file contains 'disabled'."""
+        lag_state = "disabled"
+        pci_device_addr = "00:00:01"
+        lag_state_file = os.path.join("/sys/kernel/debug/mlx5", pci_device_addr,
+                                      "lag", "state")
+        with patch("builtins.open", mock_open(read_data=lag_state)) as mock_file:
+            pci_device = sriov.PCIDevice(pci_device_addr)
+            self.assertFalse(sriov.is_vf_lag_active(pci_device))
+            mock_file.assert_called_once_with(lag_state_file, "r")
+
+    def test_is_vf_lag_active_failure(self):
+        """Test that is_vf_lag_active raises exception if it can't get VF LAG state."""
+        pci_device_addr = "00:00:01"
+        lag_state_file = os.path.join("/sys/kernel/debug/mlx5", pci_device_addr,
+                                      "lag", "state")
+        with patch("builtins.open", mock_open()) as mock_file:
+            mock_file.side_effect = FileNotFoundError()
+            pci_device = sriov.PCIDevice(pci_device_addr)
+            with self.assertRaises(OSError):
+                sriov.is_vf_lag_active(pci_device)
+
+            mock_file.assert_called_once_with(lag_state_file, "r")
 
 
 class TestParser(TestBase):

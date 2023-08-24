@@ -24,6 +24,8 @@ import netifaces
 import fnmatch
 import re
 
+from typing import Optional
+
 import netplan.libnetplan as np
 from netplan.configmanager import ConfigurationError
 from netplan.libnetplan import NetplanException
@@ -188,6 +190,28 @@ def find_matching_iface(interfaces: list, netdef):
         logging.info(matches)
         return None
     return matches[0]
+
+
+def is_interface_bonded(iface_name: str) -> bool:
+    iface_bond = os.path.join("/sys/class/net/", iface_name, "master")
+    return os.path.islink(iface_bond)
+
+
+def get_interface_bond_type(iface_name: str) -> Optional[int]:
+    if not is_interface_bonded(iface_name):
+        return None
+
+    bond_mode = os.path.join("/sys/class/net/", iface_name, "master", "bonding", "mode")
+    with open(bond_mode, "r") as f:
+        mode_value = f.readline()
+
+    try:
+        return int(mode_value.split(" ")[-1])
+    except ValueError as exc:
+        logging.error('Can not determine bonding mode of "%s". Unexpected bond mode'
+                      ' value "%s"', iface_name, mode_value)
+        raise RuntimeError("Failed to determine {} bonding mode.".format(iface_name)) \
+            from exc
 
 
 class NetplanCommand(argparse.Namespace):

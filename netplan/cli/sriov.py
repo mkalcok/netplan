@@ -29,6 +29,12 @@ from netplan.configmanager import ConfigurationError
 
 import netifaces
 
+# Mapping between smart NIC drivers and supported bond types
+# for VF LAG
+VF_LAG_SUPPORTED_BONDS = {
+    "mlx5_core": [1, 2, 4],  # active-backup, balance-xor, LACP
+}
+
 
 # PCIDevice class originates from mlnx_switchdev_mode/sriovify.py
 # Copyright 2019 Canonical Ltd, Apache License, Version 2.0
@@ -160,10 +166,39 @@ class PCIDevice(object):
         return self.pci_addr
 
 
+def is_vf_lag_enabled(iface: str, pci_device: PCIDevice) -> bool:
+    """Wait for VF LAG to be ready on bonded interface on MLX card."""
+    supported_bonds = VF_LAG_SUPPORTED_BONDS.get(pci_device.driver, [])
+    if not supported_bonds:
+        return False
+
+    try:
+        bond_type = utils.get_interface_bond_type(iface)
+    except RuntimeError:
+        logging.error("Can not determine if VF LAG is supported because bonding type"
+                      " detection on interface '%s' failed.", iface)
+        bond_type = None
+
+    return bond_type in supported_bonds
+
+
+def is_vf_lag_active(pci_device: PCIDevice) -> bool:
+    lag_state_file = os.path.join("/sys/kernel/debug/mlx5",
+                                  pci_device.pci_addr, "lag", "state")
+    try:
+        with open(lag_state_file, "r") as f:
+            return f.readline().strip() == "active"
+    except OSError as exc:
+        logging.error("Failed to read VF LAG state file (%s). Maybe the kernel driver "
+                      "does not support VF LAG monitoring.", lag_state_file)
+        raise exc
+
+
 def bind_vfs(vfs: typing.Iterable[PCIDevice], driver):
     """Bind unbound VFs to driver."""
     bound_vfs = []
     for vf in vfs:
+        logging.warning("Binding %s", )
         if not vf.bound:
             with open("/sys/bus/pci/drivers/{}/bind".format(driver), "wt") as f:
                 f.write(vf.pci_addr)
@@ -175,6 +210,7 @@ def unbind_vfs(vfs: typing.Iterable[PCIDevice], driver) -> typing.Iterable[PCIDe
     """Unbind bound VFs from driver."""
     unbound_vfs = []
     for vf in vfs:
+        logging.warning("Unbinding %s", )
         if vf.bound:
             with open("/sys/bus/pci/drivers/{}/unbind".format(driver), "wt") as f:
                 f.write(vf.pci_addr)
